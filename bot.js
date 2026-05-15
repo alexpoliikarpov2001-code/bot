@@ -193,20 +193,26 @@ async function handleTicketClose(interaction) {
     ephemeral: true,
   });
 
+  const thread = interaction.channel;
+  const threadName = thread.name;
+  const threadId = thread.id;
+
   // Public close-confirmation in the thread itself
-  const threadName = interaction.channel.name;
-  const threadId = interaction.channel.id;
-  await interaction.channel.send({
+  await thread.send({
     embeds: [{
-      description: `🔒 Тикет закрыт **${interaction.user.tag}**.\nТред заархивирован.`,
+      description: `🔒 Тикет закрыт **${interaction.user.tag}**.\nТред будет заархивирован.\nПолный транскрипт — в <#${s.channels.tickets_archive}>.`,
       color: 0x374151,
     }],
   }).catch(e => console.error('[ticket-close] send fail:', e.message));
 
+  // Save transcript to #tickets-archive BEFORE archiving the thread
+  await archiveTicketTranscript(thread, interaction.user).catch(e =>
+    console.error('[ticket-archive]', e.message));
+
   // Archive (no setLocked — locked threads need ManageThreads to even view;
   // archive alone is enough, anyone can reopen by writing into it)
   try {
-    await interaction.channel.setArchived(true, `Closed by ${interaction.user.tag}`);
+    await thread.setArchived(true, `Closed by ${interaction.user.tag}`);
     console.log(`[ticket-close] archived ${threadName} by ${interaction.user.tag}`);
   } catch (e) {
     console.error(`[ticket-close] archive failed:`, e.message);
@@ -217,6 +223,56 @@ async function handleTicketClose(interaction) {
     user: interaction.user,
     extra: { 'Тред': `<#${threadId}>  \`${threadName}\`` },
     color: 0x374151,
+  });
+}
+
+// Saves a closed ticket as a transcript embed + .txt attachment in #tickets-archive.
+async function archiveTicketTranscript(thread, closedBy) {
+  const s = state.load();
+  const archiveCh = await thread.guild.channels.fetch(s.channels.tickets_archive).catch(() => null);
+  if (!archiveCh) return;
+
+  const msgs = await thread.messages.fetch({ limit: 100 });
+  const sorted = [...msgs.values()].sort((a, b) => a.createdTimestamp - b.createdTimestamp);
+
+  // Build plain-text transcript
+  const lines = sorted.map(m => {
+    const t = new Date(m.createdTimestamp).toISOString().replace('T', ' ').slice(0, 19);
+    let content = m.content || '';
+    if (m.embeds.length && !content) content = `[embed: ${m.embeds[0].title || m.embeds[0].description?.slice(0, 80) || '...'}]`;
+    if (m.attachments.size) content += '  ' + [...m.attachments.values()].map(a => `📎 ${a.name}`).join(' ');
+    return `[${t}]  ${m.author.tag}:  ${content}`;
+  });
+  const transcript = lines.join('\n') || '(пусто)';
+
+  // Try to find original ticket author from the first embed footer
+  let originalAuthor = '—';
+  let ticketType = thread.name;
+  for (const m of sorted) {
+    const footer = m.embeds?.[0]?.footer?.text || '';
+    const idMatch = footer.match(/Создал:\s*(\S+)\s*·\s*ID:\s*(\d+)/);
+    if (idMatch) {
+      originalAuthor = `${idMatch[1]} (\`${idMatch[2]}\`)`;
+      break;
+    }
+  }
+
+  await archiveCh.send({
+    embeds: [{
+      title: `🎫 Архив: ${thread.name}`,
+      color: 0x374151,
+      fields: [
+        { name: 'Автор тикета', value: originalAuthor, inline: true },
+        { name: 'Закрыл',       value: `<@${closedBy.id}>`, inline: true },
+        { name: 'Сообщений',    value: String(sorted.length), inline: true },
+        { name: 'Тред',         value: `[Открыть оригинал](${thread.url})`, inline: false },
+      ],
+      timestamp: new Date().toISOString(),
+    }],
+    files: [{
+      attachment: Buffer.from(transcript, 'utf-8'),
+      name: `${thread.name}.txt`,
+    }],
   });
 }
 
