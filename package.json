@@ -1,0 +1,20 @@
+{
+  "name": "fury-discord-bot",
+  "version": "1.0.0",
+  "private": true,
+  "description": "FURY DayZ Discord bot — setup, tickets, status, welcome",
+  "main": "bot.js",
+  "scripts": {
+    "setup": "node setup.js",
+    "start": "node bot.js",
+    "rollback": "node setup.js --rollback"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "dependencies": {
+    "discord.js": "^14.16.3",
+    "gamedig": "^5.2.0",
+    "dotenv": "^16.4.5"
+  }
+}
