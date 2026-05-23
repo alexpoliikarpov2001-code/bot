@@ -49,6 +49,7 @@ const client = new Client({
     GatewayIntentBits.Guilds,
     GatewayIntentBits.GuildMembers,
     GatewayIntentBits.GuildMessages,
+    GatewayIntentBits.GuildVoiceStates, // для трекинга AFK в voice
   ],
   partials: [Partials.GuildMember],
 });
@@ -64,6 +65,15 @@ client.once('ready', async () => {
   // Сделка дня — пост при старте + каждое UTC-полночь (когда деал реально меняется).
   await storeBoardLoop();
   scheduleDailyAtUtcMidnight(storeBoardLoop);
+  // Заполняем AFK-таймер для всех, кто УЖЕ сидит в voice — иначе при первом
+  // прогоне sweep'а через минуту мы бы их сразу всех закинули в AFK.
+  for (const guild of client.guilds.cache.values()) {
+    const now = Date.now();
+    for (const vs of guild.voiceStates.cache.values()) {
+      if (vs.channelId) voiceLastActive.set(vs.id, now);
+    }
+  }
+  setInterval(afkSweep, 60_000); // sweep раз в минуту
 });
 
 // Считает мс до следующей UTC-полуночи. Используем чтобы синхронизировать
@@ -692,6 +702,65 @@ async function storeBoardLoop() {
     }
   } catch (e) {
     console.error('[storeBoardLoop]', e.message);
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// AFK SWEEPER — кто сидит в voice 10+ мин без активности → переезд в #afk
+// Активность = любое voice-state-событие (join/leave/move/mute/deaf/...)
+// Основателей не трогаем.
+// ═══════════════════════════════════════════════════════════════════
+
+const AFK_TIMEOUT_MS = 10 * 60_000;
+const voiceLastActive = new Map(); // userId → ts последней voice-активности
+
+client.on('voiceStateUpdate', (oldState, newState) => {
+  const userId = newState.id;
+  if (newState.channelId) {
+    // Любое изменение в voice (включая mute toggle) → освежаем таймер
+    voiceLastActive.set(userId, Date.now());
+  } else {
+    // Вышел из voice совсем — таймер не нужен
+    voiceLastActive.delete(userId);
+  }
+});
+
+async function afkSweep() {
+  try {
+    const s = state.load();
+    const afkChId = s.channels.vc_afk;
+    const founderRoleId = s.roles.founder;
+    if (!afkChId) return;
+
+    const now = Date.now();
+    for (const guild of client.guilds.cache.values()) {
+      for (const vs of guild.voiceStates.cache.values()) {
+        if (!vs.channelId || vs.channelId === afkChId) continue;
+        const member = vs.member;
+        if (!member) continue;
+        // Основателей не трогаем — пусть сидят сколько хотят
+        if (founderRoleId && member.roles.cache.has(founderRoleId)) continue;
+
+        const last = voiceLastActive.get(vs.id);
+        if (last == null) {
+          // Бот его впервые видит — начинаем таймер сейчас, не наказываем сразу
+          voiceLastActive.set(vs.id, now);
+          continue;
+        }
+        if (now - last >= AFK_TIMEOUT_MS) {
+          try {
+            await vs.setChannel(afkChId, `10 мин без активности`);
+            voiceLastActive.delete(vs.id);
+            console.log(`[afk] ${member.user?.tag || vs.id} → AFK`);
+          } catch (e) {
+            // Скорее всего у бота нет права Move Members — молча пропускаем
+            console.warn('[afk] move failed:', e.message);
+          }
+        }
+      }
+    }
+  } catch (e) {
+    console.error('[afkSweep]', e.message);
   }
 }
 
