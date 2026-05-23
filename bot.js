@@ -24,15 +24,20 @@ if (!state.exists()) {
 
 // Реальные адреса FURY DayZ серверов. Захардкожены, чтобы устаревшие значения
 // в .env (если такие остались на хостинге) не перебивали правильные.
-// Игровой порт (то что в DayZ Launcher → Direct Connect), не steam query!
-// Query-порт gamedig вычислит сам.
+//   gamePort  — то что игрок вписывает в DayZ Launcher → Direct Connect
+//   queryPort — Steam Query A2S порт, gamedig опрашивает именно его
+// Эти порты ЗАФИКСИРОВАНЫ через -port= и -steamQueryPort= в start.sh каждого
+// DayZ-сервера, и НЕ переезжают при рестартах.
 const SERVERS = [
   { key: 'cherno',  emoji: '🏝️', name: 'CHERNARUS',
-    host: '194.93.2.168', port: '2312', display: '194.93.2.168:2312' },
+    host: '194.93.2.168', queryPort: 27016, gamePort: 2312,
+    display: '194.93.2.168:2312' },
   { key: 'livonia', emoji: '🌲', name: 'LIVONIA',
-    host: '194.93.2.168', port: '2302', display: '194.93.2.168:2302' },
+    host: '194.93.2.168', queryPort: 27017, gamePort: 2302,
+    display: '194.93.2.168:2302' },
   { key: 'namalsk', emoji: '❄️', name: 'NAMALSK',
-    host: '194.93.2.168', port: '2322', display: '194.93.2.168:2322' },
+    host: '194.93.2.168', queryPort: 27018, gamePort: 2322,
+    display: '194.93.2.168:2322' },
 ];
 
 // Магазин / сделка дня.
@@ -51,14 +56,64 @@ const client = new Client({
 client.once('ready', async () => {
   console.log(`✓ Бот онлайн: ${client.user.tag}`);
   console.log(`  Сервер: ${client.guilds.cache.size} guild(s)`);
+  // Обновить статичные «Подключиться к серверам» один раз при старте.
+  await refreshConnectInfo().catch((e) => console.error('[connect-info]', e.message));
   await masterLoop();             // first tick immediately
   setInterval(masterLoop, 60_000); // every minute
   // Сделка дня — постим/обновляем сразу + каждые 10 минут.
-  // Бэкенд считает сделку по дню (UTC midnight), внутри дня она не меняется;
-  // обновление раз в 10 мин — чтобы UTC-смена дня была видна без задержки.
   await storeBoardLoop();
   setInterval(storeBoardLoop, 10 * 60_000);
 });
+
+// ═══════════════════════════════════════════════════════════════════
+// CONNECT INFO — статичный «Скопируй IP → Direct Connect» в #статус-серверов
+// Обновляется один раз при старте бота — нужно если IP/порты сменились.
+// ═══════════════════════════════════════════════════════════════════
+
+const CONNECT_EMBED_MARKER = 'FURY • Подключиться к серверам';
+
+function buildConnectEmbed(state_) {
+  const lines = SERVERS.map(s => `${s.emoji}  **${s.name}** · \`${s.host}:${s.gamePort}\``).join('\n');
+  const patchCh = state_.channels.patchnotes;
+  const helpCh  = state_.channels.help;
+  const ticketsCh = state_.channels.tickets;
+  return {
+    author: { name: CONNECT_EMBED_MARKER },
+    title: '🌐 Подключиться к серверам',
+    description:
+      'Скопируй IP → запусти DayZ → **Servers → Direct Connect** → вставь и подключайся.\n\n' +
+      lines + '\n\n' +
+      `Перед первым входом — подпишись на коллекцию модов в <#${patchCh}>. Без модов сервер не пустит.\n\n` +
+      `Не подключается — <#${helpCh}> или <#${ticketsCh}>`,
+    color: 0x8B0000,
+  };
+}
+
+async function refreshConnectInfo() {
+  const s = state.load();
+  const statusCh = await client.channels.fetch(s.channels.status).catch(() => null);
+  if (!statusCh) return;
+  const embed = buildConnectEmbed(s);
+
+  // Ищем существующее сообщение бота с маркером в author.name
+  let existing = null;
+  try {
+    const msgs = await statusCh.messages.fetch({ limit: 50 });
+    existing = msgs.find(m =>
+      m.author && m.author.id === client.user.id &&
+      m.embeds && m.embeds[0] && m.embeds[0].author && m.embeds[0].author.name === CONNECT_EMBED_MARKER
+    );
+  } catch (e) { /* ignore */ }
+
+  if (existing) {
+    await existing.edit({ embeds: [embed] });
+    console.log('✓ connect-info обновлён');
+  } else {
+    const msg = await statusCh.send({ embeds: [embed] });
+    try { await msg.pin().catch(() => {}); } catch (_) {}
+    console.log('✓ connect-info создан');
+  }
+}
 
 // ═══════════════════════════════════════════════════════════════════
 // BUTTON INTERACTIONS
@@ -420,7 +475,7 @@ async function masterLoop() {
   try {
     const s = state.load();
     const results = await Promise.all(SERVERS.map(srv =>
-      dayz.query({ host: srv.host, port: srv.port })
+      dayz.query({ host: srv.host, port: srv.queryPort })
     ));
 
     // ── status embed ───────────────────────────────────────────
@@ -562,9 +617,26 @@ async function storeBoardLoop() {
       footer: { text: 'Сделка дня обновляется в 00:00 UTC  •  скидка только на первую единицу товара' },
     };
 
+    // 1) пробуем по сохранённому ID
     let msg = null;
     if (s.messages.storeBoard) {
       msg = await storeCh.messages.fetch(s.messages.storeBoard).catch(() => null);
+    }
+    // 2) если ID не сработал (state.json мог сбросится через git pull) —
+    //    ищем существующее сообщение бота с маркером "FURY • МАГАЗИН"
+    if (!msg) {
+      try {
+        const msgs = await storeCh.messages.fetch({ limit: 50 });
+        msg = msgs.find(m =>
+          m.author && m.author.id === client.user.id &&
+          m.embeds && m.embeds[0] && m.embeds[0].author && m.embeds[0].author.name === 'FURY • МАГАЗИН'
+        );
+        if (msg) {
+          s.messages.storeBoard = msg.id;
+          state.save(s);
+          console.log('✓ store-сообщение найдено по маркеру', msg.id);
+        }
+      } catch (_) { /* ignore */ }
     }
     if (msg) {
       await msg.edit({ embeds: [embed] });
