@@ -56,21 +56,41 @@ const client = new Client({
 client.once('ready', async () => {
   console.log(`✓ Бот онлайн: ${client.user.tag}`);
   console.log(`  Сервер: ${client.guilds.cache.size} guild(s)`);
-  // Обновить статичные «Подключиться к серверам» один раз при старте.
-  await refreshConnectInfo().catch((e) => console.error('[connect-info]', e.message));
-  await masterLoop();             // first tick immediately
-  setInterval(masterLoop, 60_000); // every minute
-  // Сделка дня — постим/обновляем сразу + каждые 10 минут.
+  // Чистим #статус-серверов от своих старых сообщений и постим заново
+  // в правильном порядке: сначала connect-info, потом placeholder для статуса.
+  await rebuildStatusChannel().catch((e) => console.error('[rebuild-status]', e.message));
+  await masterLoop();             // первый тик статуса
+  setInterval(masterLoop, 60_000); // каждую минуту
+  // Сделка дня — пост при старте + каждое UTC-полночь (когда деал реально меняется).
   await storeBoardLoop();
-  setInterval(storeBoardLoop, 10 * 60_000);
+  scheduleDailyAtUtcMidnight(storeBoardLoop);
 });
 
+// Считает мс до следующей UTC-полуночи. Используем чтобы синхронизировать
+// апдейт магазина со сменой deal'а на сайте (бэкенд считает deal по UTC дню).
+function msUntilNextUtcMidnight() {
+  const now = new Date();
+  const next = new Date(Date.UTC(
+    now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate() + 1,
+    0, 0, 5  // +5 сек запас, чтобы точно после полуночи
+  ));
+  return next - now;
+}
+
+function scheduleDailyAtUtcMidnight(fn) {
+  setTimeout(async () => {
+    await fn();
+    setInterval(fn, 24 * 60 * 60_000);
+  }, msUntilNextUtcMidnight());
+}
+
 // ═══════════════════════════════════════════════════════════════════
-// CONNECT INFO — статичный «Скопируй IP → Direct Connect» в #статус-серверов
-// Обновляется один раз при старте бота — нужно если IP/порты сменились.
+// REBUILD STATUS CHANNEL — чистим свои старые сообщения и постим заново
+// в правильном порядке. Делается ОДИН РАЗ при старте бота.
 // ═══════════════════════════════════════════════════════════════════
 
 const CONNECT_EMBED_MARKER = 'FURY • Подключиться к серверам';
+const STATUS_EMBED_MARKER  = 'FURY • СТАТУС СЕРВЕРОВ';
 
 function buildConnectEmbed(state_) {
   const lines = SERVERS.map(s => `${s.emoji}  **${s.name}** · \`${s.host}:${s.gamePort}\``).join('\n');
@@ -89,29 +109,54 @@ function buildConnectEmbed(state_) {
   };
 }
 
-async function refreshConnectInfo() {
+// На старте полностью очищаем #статус-серверов от своих сообщений и
+// перепостим: 1) connect-info, 2) пустышка для статуса (заполнится в masterLoop).
+// Это гарантирует правильный порядок (старое сверху, новое снизу — Discord ordering)
+// и исключает дубликаты при многократных рестартах/деплоях.
+async function rebuildStatusChannel() {
   const s = state.load();
-  const statusCh = await client.channels.fetch(s.channels.status).catch(() => null);
-  if (!statusCh) return;
-  const embed = buildConnectEmbed(s);
+  const ch = await client.channels.fetch(s.channels.status).catch(() => null);
+  if (!ch) return;
 
-  // Ищем существующее сообщение бота с маркером в author.name
-  let existing = null;
+  // 1) Удаляем все свои сообщения в этом канале (до 100 свежих).
   try {
-    const msgs = await statusCh.messages.fetch({ limit: 50 });
-    existing = msgs.find(m =>
-      m.author && m.author.id === client.user.id &&
-      m.embeds && m.embeds[0] && m.embeds[0].author && m.embeds[0].author.name === CONNECT_EMBED_MARKER
-    );
-  } catch (e) { /* ignore */ }
+    const msgs = await ch.messages.fetch({ limit: 100 });
+    let killed = 0;
+    for (const m of msgs.values()) {
+      if (m.author && m.author.id === client.user.id) {
+        await m.delete().catch(() => {});
+        killed++;
+      }
+    }
+    if (killed > 0) console.log(`✓ удалено ${killed} старых сообщений бота в #статус-серверов`);
+  } catch (e) {
+    console.warn('[rebuild-status] fetch/delete failed:', e.message);
+  }
 
-  if (existing) {
-    await existing.edit({ embeds: [embed] });
-    console.log('✓ connect-info обновлён');
-  } else {
-    const msg = await statusCh.send({ embeds: [embed] });
-    try { await msg.pin().catch(() => {}); } catch (_) {}
-    console.log('✓ connect-info создан');
+  // 2) Постим connect-info ПЕРВЫМ (он будет наверху).
+  const connectEmbed = buildConnectEmbed(s);
+  const connectMsg = await ch.send({ embeds: [connectEmbed] }).catch((e) => {
+    console.error('[rebuild-status] connect send fail:', e.message); return null;
+  });
+  if (connectMsg) {
+    await connectMsg.pin().catch(() => {});  // на всякий — фиксируем сверху
+    console.log('✓ connect-info запостен', connectMsg.id);
+  }
+
+  // 3) Постим placeholder статуса. masterLoop через секунду его перепишет реальными данными.
+  const statusMsg = await ch.send({
+    embeds: [{
+      author: { name: STATUS_EMBED_MARKER },
+      description: 'Подождите, опрашиваю серверы…',
+      color: 0x8B0000,
+    }],
+  }).catch((e) => {
+    console.error('[rebuild-status] status send fail:', e.message); return null;
+  });
+  if (statusMsg) {
+    s.messages.statusBoard = statusMsg.id;
+    state.save(s);
+    console.log('✓ status placeholder запостен', statusMsg.id);
   }
 }
 
@@ -484,26 +529,25 @@ async function masterLoop() {
 
     const fields = SERVERS.map((srv, i) => {
       const r = results[i];
-      const display = srv.display || `${srv.host}:${srv.port}`;
+      const display = srv.display || `${srv.host}:${srv.gamePort || srv.port}`;
       if (!r.ok) {
         return {
           name: `${srv.emoji}  ${srv.name}`,
-          value: `❌ offline · \`${display}\`\n*${(r.error || '').slice(0, 80)}*`,
+          value: `🔴 **offline** · \`${display}\``,
           inline: false,
         };
       }
-      const bar = dayz.progressBar(r.online, r.max, 10);
       const hot = r.online >= r.max ? '  🔥' : '';
-      const queueLine = r.queue > 0 ? `  ·  очередь: \`${r.queue}\`` : '';
+      const queueLine = r.queue > 0 ? `  ·  очередь: ${r.queue}` : '';
       return {
         name: `${srv.emoji}  ${srv.name}`,
-        value: `\`${r.online}/${r.max}\` ${bar}${hot}${queueLine}\n\`${display}\``,
+        value: `🟢 **${r.online}/${r.max}**${hot}${queueLine} · \`${display}\``,
         inline: false,
       };
     });
 
     const embed = {
-      author: { name: 'FURY • СТАТУС СЕРВЕРОВ' },
+      author: { name: STATUS_EMBED_MARKER },
       description: `*обновлено · <t:${Math.floor(Date.now() / 1000)}:R>*`,
       color: 0x8B0000,
       fields,
