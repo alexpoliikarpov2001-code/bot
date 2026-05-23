@@ -22,14 +22,22 @@ if (!state.exists()) {
   process.exit(1);
 }
 
+// Реальные адреса FURY DayZ серверов. Захардкожены, чтобы устаревшие значения
+// в .env (если такие остались на хостинге) не перебивали правильные.
+// Игровой порт (то что в DayZ Launcher → Direct Connect), не steam query!
+// Query-порт gamedig вычислит сам.
 const SERVERS = [
   { key: 'cherno',  emoji: '🏝️', name: 'CHERNARUS',
-    host: process.env.CHERNO_HOST,  port: process.env.CHERNO_PORT,  display: process.env.CHERNO_DISPLAY },
+    host: '194.93.2.168', port: '2312', display: '194.93.2.168:2312' },
   { key: 'livonia', emoji: '🌲', name: 'LIVONIA',
-    host: process.env.LIVONIA_HOST, port: process.env.LIVONIA_PORT, display: process.env.LIVONIA_DISPLAY },
+    host: '194.93.2.168', port: '2302', display: '194.93.2.168:2302' },
   { key: 'namalsk', emoji: '❄️', name: 'NAMALSK',
-    host: process.env.NAMALSK_HOST, port: process.env.NAMALSK_PORT, display: process.env.NAMALSK_DISPLAY },
+    host: '194.93.2.168', port: '2322', display: '194.93.2.168:2322' },
 ];
+
+// Магазин / сделка дня.
+const SITE_URL = 'https://furydayz.ru';
+const SITE_DAILY_DEAL_API = `${SITE_URL}/api/daily-deal`;
 
 const client = new Client({
   intents: [
@@ -45,6 +53,11 @@ client.once('ready', async () => {
   console.log(`  Сервер: ${client.guilds.cache.size} guild(s)`);
   await masterLoop();             // first tick immediately
   setInterval(masterLoop, 60_000); // every minute
+  // Сделка дня — постим/обновляем сразу + каждые 10 минут.
+  // Бэкенд считает сделку по дню (UTC midnight), внутри дня она не меняется;
+  // обновление раз в 10 мин — чтобы UTC-смена дня была видна без задержки.
+  await storeBoardLoop();
+  setInterval(storeBoardLoop, 10 * 60_000);
 });
 
 // ═══════════════════════════════════════════════════════════════════
@@ -476,6 +489,93 @@ async function masterLoop() {
     }
   } catch (e) {
     console.error('[masterLoop]', e.message);
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// STORE BOARD — сделка дня + ссылка на сайт в #магазин-донат
+// ═══════════════════════════════════════════════════════════════════
+
+async function fetchDailyDeal() {
+  try {
+    const r = await fetch(SITE_DAILY_DEAL_API, { headers: { 'Accept': 'application/json' } });
+    if (!r.ok) return { ok: false, error: `http_${r.status}` };
+    const data = await r.json();
+    return { ok: true, data };
+  } catch (e) {
+    return { ok: false, error: e.message || String(e) };
+  }
+}
+
+function fmtMoney(n) {
+  return String(Math.round(Number(n) || 0)).replace(/\B(?=(\d{3})+(?!\d))/g, ' ');
+}
+
+async function storeBoardLoop() {
+  try {
+    const s = state.load();
+    const storeChId = s.channels.store;
+    if (!storeChId) return;
+    const storeCh = await client.channels.fetch(storeChId).catch(() => null);
+    if (!storeCh) return;
+
+    const r = await fetchDailyDeal();
+
+    // Базовый «шапочный» блок — постоянная инфа о магазине.
+    const fields = [
+      {
+        name: '🌐  Сайт магазина',
+        value: '**[' + SITE_URL.replace(/^https?:\/\//, '') + '](' + SITE_URL + ')**\n' +
+               'Пополни баланс и покупай предметы прямо в инвентарь — заходишь в игру и получаешь по команде `$code <код>`',
+        inline: false,
+      },
+    ];
+
+    // Сделка дня — отдельный блок, если API ответил.
+    if (r.ok && r.data && r.data.product) {
+      const d = r.data;
+      const name = d.product.name_ru || d.product.id;
+      const ends = d.ends_at ? Math.floor(d.ends_at / 1000) : null;
+      const endsLine = ends ? `\nДо конца: <t:${ends}:R>` : '';
+      fields.push({
+        name: '🔥  СДЕЛКА ДНЯ',
+        value:
+          `**${name}**` +
+          (d.product.cat ? `  •  *${d.product.cat}*` : '') + '\n' +
+          `~~${fmtMoney(d.base_price)} ₽~~  →  **${fmtMoney(d.deal_price)} ₽**  (\`−${d.discount_pct}%\`)` +
+          endsLine,
+        inline: false,
+      });
+    } else {
+      fields.push({
+        name: '🔥  СДЕЛКА ДНЯ',
+        value: r.ok ? '*сегодня без скидки*' : `*не удалось получить (${r.error})*`,
+        inline: false,
+      });
+    }
+
+    const embed = {
+      author: { name: 'FURY • МАГАЗИН' },
+      description: `*обновлено · <t:${Math.floor(Date.now() / 1000)}:R>*`,
+      color: 0xC89B4F, // ember
+      fields,
+      footer: { text: 'Сделка дня обновляется в 00:00 UTC  •  скидка только на первую единицу товара' },
+    };
+
+    let msg = null;
+    if (s.messages.storeBoard) {
+      msg = await storeCh.messages.fetch(s.messages.storeBoard).catch(() => null);
+    }
+    if (msg) {
+      await msg.edit({ embeds: [embed] });
+    } else {
+      msg = await storeCh.send({ embeds: [embed] });
+      s.messages.storeBoard = msg.id;
+      state.save(s);
+      console.log('✓ store-сообщение создано', msg.id);
+    }
+  } catch (e) {
+    console.error('[storeBoardLoop]', e.message);
   }
 }
 
