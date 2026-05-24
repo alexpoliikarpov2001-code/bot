@@ -2,7 +2,7 @@
 // Handles: verify button, ticket buttons, role-pick buttons, welcome/leave,
 // live status board, live VC name with player count, store daily-deal board.
 
-require('dotenv').config();
+require('dotenv').config({ override: true });
 const {
   Client, GatewayIntentBits, Partials, ChannelType,
   ButtonStyle, ButtonBuilder, ActionRowBuilder, PermissionFlagsBits,
