@@ -33,10 +33,10 @@ const SERVERS = [
     host: '194.93.2.168', queryPort: 27016, gamePort: 2312,
     display: '194.93.2.168:2312' },
   { key: 'livonia', emoji: '🌲', name: 'LIVONIA',
-    host: '194.93.2.168', queryPort: 27017, gamePort: 2302,
+    host: '194.93.2.168', queryPort: 27018, gamePort: 2302,
     display: '194.93.2.168:2302' },
   { key: 'namalsk', emoji: '❄️', name: 'NAMALSK',
-    host: '194.93.2.168', queryPort: 27018, gamePort: 2322,
+    host: '194.93.2.168', queryPort: 27017, gamePort: 2322,
     display: '194.93.2.168:2322' },
 ];
 
